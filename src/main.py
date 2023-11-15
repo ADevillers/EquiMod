@@ -51,7 +51,7 @@ def init():
 
 
 
-def train_repr(model, optimizer, criterion, loader, scheduler, scaler, args, device, is_master, global_rank, world_size):
+def train_repr(model, momentum_model, optimizer, criterion, loader, scheduler, scaler, args, device, is_master, global_rank, world_size):
     model.train()
 
     tracker.reset('train_loss_z')
@@ -69,23 +69,31 @@ def train_repr(model, optimizer, criterion, loader, scheduler, scaler, args, dev
     tracker.reset('train_h_norm_std')
     tracker.reset('train_z_norm_mean')
     tracker.reset('train_z_norm_std')
+    tracker.reset('train_q_norm_mean')
+    tracker.reset('train_q_norm_std')
+
+    tracker.reset('train_m_h_norm_mean')
+    tracker.reset('train_m_h_norm_std')
+    tracker.reset('train_m_z_norm_mean')
+    tracker.reset('train_m_z_norm_std')
 
     tracker.reset('train_eqgain')
     tracker.reset('train_eqgain_bis')
+    tracker.reset('train_tau')
 
     if args.dataset_name == 'cifar10':
         p_mean = torch.tensor([[4.3122e+00, 4.3216e+00, 2.3369e+01, 2.3374e+01, 4.9998e-01, 8.0087e-01,
             1.2025e+00, 1.4007e+00, 1.5964e+00, 1.8004e+00, 9.9993e-01, 1.0002e+00,
-            9.9986e-01, 2.2321e-07, 1.9965e-01]]).to(device)
+            9.9986e-01, 2.2321e-07, 1.9965e-01, 2.7256e-01, 5.2507e-01, 5.0149e-2]]).to(device)
         p_std = torch.tensor([[3.9740, 3.9851, 4.9544, 4.9539, 0.5000, 0.3993, 1.1651, 1.0210, 1.0200,
-            1.1669, 0.2066, 0.2068, 0.2066, 0.0517, 0.3997]]).to(device)
+            1.1669, 0.2066, 0.2068, 0.2066, 0.0517, 0.3997, 3.0381e-01, 6.5251e-01, 6.4719e-2]]).to(device)
     elif args.dataset_name == 'imagenet':
         p_mean = torch.tensor([[6.8162e+01, 9.9199e+01, 2.6933e+02, 2.7457e+02, 4.9905e-01, 8.0054e-01,
             1.1998e+00, 1.3994e+00, 1.6014e+00, 1.7995e+00, 1.0001e+00, 1.0000e+00,
-            1.0005e+00, 1.5640e-04, 2.0018e-01, 5.0030e-01, 5.2507e-01]]).to(device)
+            1.0005e+00, 1.5640e-04, 2.0018e-01, 2.7256e-01, 5.2507e-01, 5.0149e-2]]).to(device)
         p_std = torch.tensor([[7.7370e+01, 9.8681e+01, 1.3686e+02, 1.4349e+02, 5.0000e-01, 3.9959e-01,
             1.1661e+00, 1.0201e+00, 1.0201e+00, 1.1657e+00, 4.1347e-01, 4.1323e-01,
-            4.1349e-01, 1.0333e-01, 4.0013e-01, 5.0000e-01, 6.5251e-01]]).to(device)
+            4.1349e-01, 1.0333e-01, 4.0013e-01, 3.0381e-01, 6.5251e-01, 6.4719e-2]]).to(device)
 
     for i, batch in enumerate(loader):
         optimizer.zero_grad()
@@ -104,20 +112,33 @@ def train_repr(model, optimizer, criterion, loader, scheduler, scaler, args, dev
         p = (p - p_mean)/p_std
 
         with torch.cuda.amp.autocast(args.precision == 'mixed'):
-            h, z, y0, yt, yt_hat = model(x, p)
+            step = (tracker.get('epoch').count - 1)*len(loader) + i
+            total_step = args.nb_epochs*len(loader)
+
+            with torch.no_grad():
+                if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+                    momentum_model.module.update(model.module.resnet, model.module.proj_head_inv, step, total_step)
+                    tracker.add('train_tau', momentum_model.module.tau, 1)
+                else:
+                    momentum_model.update(model.resnet, model.proj_head_inv, step, total_step)
+                    tracker.add('train_tau', momentum_model.tau, 1)
+
+            h, z, q, y0, yt, yt_hat = model(x, p)
+
+            with torch.no_grad():
+                m_h, m_z = momentum_model(x[x.shape[0]//3:])
+                m_h, m_z = m_h.to(q.device), m_z.to(q.device)
 
         batch_size = img_1.shape[0]        
 
         # Gather all embeddings arcoss all devices to compute contrastive loss over all negatives
         if args.hardware == 'multi-gpu':
-            all_z = gather_pairs(z, global_rank, world_size)
             all_y = gather_pairs(torch.cat([yt, yt_hat], dim=0), global_rank, world_size)
         else:
-            all_z = z
             all_y = torch.cat([yt, yt_hat], dim=0)
 
         with torch.cuda.amp.autocast(args.precision == 'mixed'):
-            loss_z = criterion['NTXentLoss'](all_z, args.temperature_z)*world_size
+            loss_z = criterion['BYOLLoss'](m_z, q)
             loss_eq_y = criterion['NTXentLoss'](all_y, args.temperature_y)*world_size
 
             loss = loss_z + loss_eq_y*args.lmbd
@@ -142,6 +163,13 @@ def train_repr(model, optimizer, criterion, loader, scheduler, scaler, args, dev
         tracker.add('train_h_norm_std', h.detach().norm(dim=1).std(), 1)
         tracker.add('train_z_norm_mean', z.detach().norm(dim=1).mean(), 1)
         tracker.add('train_z_norm_std', z.detach().norm(dim=1).std(), 1)
+        tracker.add('train_q_norm_mean', q.detach().norm(dim=1).mean(), 1)
+        tracker.add('train_q_norm_std', q.detach().norm(dim=1).std(), 1)
+
+        tracker.add('train_m_h_norm_mean', m_h.detach().norm(dim=1).mean(), 1)
+        tracker.add('train_m_h_norm_std', m_h.detach().norm(dim=1).std(), 1)
+        tracker.add('train_m_z_norm_mean', m_z.detach().norm(dim=1).mean(), 1)
+        tracker.add('train_m_z_norm_std', m_z.detach().norm(dim=1).std(), 1)
 
         tracker.add('train_eqgain', (cos(yt, yt_hat) - cos(yt, y0)).sum(), batch_size*2)
         tracker.add('train_eqgain_bis', ((1. - cos(yt, y0))/(1. - cos(yt, yt_hat))).sum(), batch_size*2)
@@ -170,13 +198,21 @@ def train_repr(model, optimizer, criterion, loader, scheduler, scaler, args, dev
         writer.add_scalar('train_h_norm_std', tracker.get('train_h_norm_std').average, tracker.get('epoch').count)
         writer.add_scalar('train_z_norm_mean', tracker.get('train_z_norm_mean').average, tracker.get('epoch').count)
         writer.add_scalar('train_z_norm_std', tracker.get('train_z_norm_std').average, tracker.get('epoch').count)
+        writer.add_scalar('train_q_norm_mean', tracker.get('train_q_norm_mean').average, tracker.get('epoch').count)
+        writer.add_scalar('train_q_norm_mean', tracker.get('train_q_norm_mean').average, tracker.get('epoch').count)
+
+        writer.add_scalar('train_m_h_norm_mean', tracker.get('train_m_h_norm_mean').average, tracker.get('epoch').count)
+        writer.add_scalar('train_m_h_norm_std', tracker.get('train_m_h_norm_std').average, tracker.get('epoch').count)
+        writer.add_scalar('train_m_z_norm_mean', tracker.get('train_m_z_norm_mean').average, tracker.get('epoch').count)
+        writer.add_scalar('train_m_z_norm_std', tracker.get('train_m_z_norm_std').average, tracker.get('epoch').count)
         
         writer.add_scalar('train_eqgain', tracker.get('train_eqgain').average, tracker.get('epoch').count)
         writer.add_scalar('train_eqgain_bis', tracker.get('train_eqgain_bis').average, tracker.get('epoch').count)
+        writer.add_scalar('train_tau', tracker.get('train_tau').average, tracker.get('epoch').count)
 
 
 
-def eval_repr(model, criterion, loader, args, device, is_master, global_rank, world_size):
+def eval_repr(model, momentum_model, criterion, loader, args, device, is_master, global_rank, world_size):
     model.eval()
 
     tracker.reset('eval_loss_z')
@@ -194,6 +230,13 @@ def eval_repr(model, criterion, loader, args, device, is_master, global_rank, wo
     tracker.reset('eval_h_norm_std')
     tracker.reset('eval_z_norm_mean')
     tracker.reset('eval_z_norm_std')
+    tracker.reset('eval_q_norm_mean')
+    tracker.reset('eval_q_norm_std')
+
+    tracker.reset('eval_m_h_norm_mean')
+    tracker.reset('eval_m_h_norm_std')
+    tracker.reset('eval_m_z_norm_mean')
+    tracker.reset('eval_m_z_norm_std')
 
     tracker.reset('eval_eqgain')
     tracker.reset('eval_eqgain_bis')
@@ -201,16 +244,16 @@ def eval_repr(model, criterion, loader, args, device, is_master, global_rank, wo
     if args.dataset_name == 'cifar10':
         p_mean = torch.tensor([[4.3122e+00, 4.3216e+00, 2.3369e+01, 2.3374e+01, 4.9998e-01, 8.0087e-01,
             1.2025e+00, 1.4007e+00, 1.5964e+00, 1.8004e+00, 9.9993e-01, 1.0002e+00,
-            9.9986e-01, 2.2321e-07, 1.9965e-01]]).to(device)
+            9.9986e-01, 2.2321e-07, 1.9965e-01, 2.7256e-01, 5.2507e-01, 5.0149e-2]]).to(device)
         p_std = torch.tensor([[3.9740, 3.9851, 4.9544, 4.9539, 0.5000, 0.3993, 1.1651, 1.0210, 1.0200,
-            1.1669, 0.2066, 0.2068, 0.2066, 0.0517, 0.3997]]).to(device)
+            1.1669, 0.2066, 0.2068, 0.2066, 0.0517, 0.3997, 3.0381e-01, 6.5251e-01, 6.4719e-2]]).to(device)
     elif args.dataset_name == 'imagenet':
         p_mean = torch.tensor([[6.8162e+01, 9.9199e+01, 2.6933e+02, 2.7457e+02, 4.9905e-01, 8.0054e-01,
             1.1998e+00, 1.3994e+00, 1.6014e+00, 1.7995e+00, 1.0001e+00, 1.0000e+00,
-            1.0005e+00, 1.5640e-04, 2.0018e-01, 5.0030e-01, 5.2507e-01]]).to(device)
+            1.0005e+00, 1.5640e-04, 2.0018e-01, 2.7256e-01, 5.2507e-01, 5.0149e-2]]).to(device)
         p_std = torch.tensor([[7.7370e+01, 9.8681e+01, 1.3686e+02, 1.4349e+02, 5.0000e-01, 3.9959e-01,
             1.1661e+00, 1.0201e+00, 1.0201e+00, 1.1657e+00, 4.1347e-01, 4.1323e-01,
-            4.1349e-01, 1.0333e-01, 4.0013e-01, 5.0000e-01, 6.5251e-01]]).to(device)
+            4.1349e-01, 1.0333e-01, 4.0013e-01, 3.0381e-01, 6.5251e-01, 6.4719e-2]]).to(device)
 
     with torch.no_grad():
         for i, batch in enumerate(loader):
@@ -228,20 +271,21 @@ def eval_repr(model, criterion, loader, args, device, is_master, global_rank, wo
             p = (p - p_mean)/p_std
 
             with torch.cuda.amp.autocast(args.precision == 'mixed'):
-                h, z, y0, yt, yt_hat = model(x, p)
+                h, z, q, y0, yt, yt_hat = model(x, p)
+
+                m_h, m_z = momentum_model(x[x.shape[0]//3:])
+                m_h, m_z = m_h.to(q.device), m_z.to(q.device)
 
             batch_size = img_1.shape[0]        
 
             # Gather all embeddings arcoss all devices to compute contrastive loss over all negatives
             if args.hardware == 'multi-gpu':
-                all_z = gather_pairs(z, global_rank, world_size)
                 all_y = gather_pairs(torch.cat([yt, yt_hat], dim=0), global_rank, world_size)
             else:
-                all_z = z
                 all_y = torch.cat([yt, yt_hat], dim=0)
 
             with torch.cuda.amp.autocast(args.precision == 'mixed'):
-                loss_z = criterion['NTXentLoss'](all_z, args.temperature_z)*world_size
+                loss_z = criterion['BYOLLoss'](m_z, q)
                 loss_eq_y = criterion['NTXentLoss'](all_y, args.temperature_y)*world_size
 
                 loss = loss_z + loss_eq_y*args.lmbd
@@ -261,6 +305,13 @@ def eval_repr(model, criterion, loader, args, device, is_master, global_rank, wo
             tracker.add('eval_h_norm_std', h.norm(dim=1).std(), 1)
             tracker.add('eval_z_norm_mean', z.norm(dim=1).mean(), 1)
             tracker.add('eval_z_norm_std', z.norm(dim=1).std(), 1)
+            tracker.add('eval_q_norm_mean', q.norm(dim=1).mean(), 1)
+            tracker.add('eval_q_norm_std', q.norm(dim=1).std(), 1)
+
+            tracker.add('eval_m_h_norm_mean', m_h.norm(dim=1).mean(), 1)
+            tracker.add('eval_m_h_norm_std', m_h.norm(dim=1).std(), 1)
+            tracker.add('eval_m_z_norm_mean', m_z.norm(dim=1).mean(), 1)
+            tracker.add('eval_m_z_norm_std', m_z.norm(dim=1).std(), 1)
 
             tracker.add('eval_eqgain', (cos(yt, yt_hat) - cos(yt, y0)).sum(), batch_size*2)
             tracker.add('eval_eqgain_bis', ((1. - cos(yt, y0))/(1. - cos(yt, yt_hat))).sum(), batch_size*2)
@@ -289,6 +340,13 @@ def eval_repr(model, criterion, loader, args, device, is_master, global_rank, wo
             writer.add_scalar('eval_h_norm_std', tracker.get('eval_h_norm_std').average, tracker.get('epoch').count)
             writer.add_scalar('eval_z_norm_mean', tracker.get('eval_z_norm_mean').average, tracker.get('epoch').count)
             writer.add_scalar('eval_z_norm_std', tracker.get('eval_z_norm_std').average, tracker.get('epoch').count)
+            writer.add_scalar('eval_q_norm_mean', tracker.get('eval_q_norm_mean').average, tracker.get('epoch').count)
+            writer.add_scalar('eval_q_norm_std', tracker.get('eval_q_norm_std').average, tracker.get('epoch').count)
+
+            writer.add_scalar('eval_m_h_norm_mean', tracker.get('eval_m_h_norm_mean').average, tracker.get('epoch').count)
+            writer.add_scalar('eval_m_h_norm_std', tracker.get('eval_m_h_norm_std').average, tracker.get('epoch').count)
+            writer.add_scalar('eval_m_z_norm_mean', tracker.get('eval_m_z_norm_mean').average, tracker.get('epoch').count)
+            writer.add_scalar('eval_m_z_norm_std', tracker.get('eval_m_z_norm_std').average, tracker.get('epoch').count)
 
             writer.add_scalar('eval_eqgain', tracker.get('eval_eqgain').average, tracker.get('epoch').count)
             writer.add_scalar('eval_eqgain_bis', tracker.get('eval_eqgain_bis').average, tracker.get('epoch').count)
@@ -571,16 +629,21 @@ def run(args):
 
     ######### MODEL and CO #########
     # CREATE MODEL
-    model = EquiMod(args.resnet_type, args.z_dim, args.y_dim, train_repr_set.nb_params, args.dataset_name=='cifar10', args.proj_head_eq_layers, args.proj_head_t_layers, args.predictor_eq_layers).to(device)
+    model = EquiMod(args.resnet_type, args.z_dim, args.y_dim, train_repr_set.nb_params, args.dataset_name=='cifar10').to(device)
+    momentum_model = MomentumResNet(model.resnet, model.proj_head_inv, args.tau_base).to(device)
     if checkpoint is not None:
         model.load_state_dict(checkpoint['model'])
+        momentum_model.load_state_dict(checkpoint['momentum_model'])
     if args.hardware == 'multi-gpu':
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        model = DDP(model, device_ids=[local_rank])
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        momentum_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(momentum_model)
+        momentum_model = DDP(momentum_model, device_ids=[local_rank], find_unused_parameters=True)
 
     # CREATE CRITERION
     criterion_repr = {
-        'NTXentLoss': NTXentLoss()
+        'NTXentLoss': NTXentLoss(),
+        'BYOLLoss': BYOLLoss()
     }
 
     # CREATE OPTIMIZER
@@ -634,8 +697,8 @@ def run(args):
         else:
             scheduler_repr = cosine_scheduler_repr
 
-        train_repr(model, optimizer_repr, criterion_repr, train_repr_loader, scheduler_repr, scaler, args, device, is_master, global_rank, world_size)
-        eval_repr(model, criterion_repr, eval_repr_loader, args, device, is_master, global_rank, world_size)
+        train_repr(model, momentum_model, optimizer_repr, criterion_repr, train_repr_loader, scheduler_repr, scaler, args, device, is_master, global_rank, world_size)
+        eval_repr(model, momentum_model, criterion_repr, eval_repr_loader, args, device, is_master, global_rank, world_size)
 
         if is_master:
             if scheduler_repr is not None:
@@ -650,6 +713,7 @@ def run(args):
                 'last_epoch': epoch,
                 'log_dir': log_dir,
                 'model': model.module.state_dict() if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model.state_dict(),
+                'momentum_model': momentum_model.module.state_dict() if isinstance(momentum_model, torch.nn.parallel.DistributedDataParallel) else momentum_model.state_dict(),
                 'optimizer_repr': optimizer_repr.state_dict(),
                 'warm_up_scheduler_repr': warm_up_scheduler_repr.state_dict(),
                 'cosine_scheduler_repr': cosine_scheduler_repr.state_dict()
@@ -731,7 +795,7 @@ if __name__ == '__main__':
         help='Size of the global batch')
 
     parser.add_argument('--lr_init', type=float,
-        default=4.0,
+        default=2.0,
         help='Initial learning rate')
 
     parser.add_argument('--momentum', type=float,
@@ -747,16 +811,16 @@ if __name__ == '__main__':
         help='Eta LARS parameter')
 
     parser.add_argument('--z_dim', type=int,
-        default=128,
+        default=256,
         help='Dimension of z')
 
     parser.add_argument('--y_dim', type=int,
         default=128,
         help='Dimension of y')
 
-    parser.add_argument('--temperature_z', type=float,
-        default=0.5,
-        help='Temperature of the NTXent loss for the z')
+    parser.add_argument('--tau_base', type=float,
+        default=0.996,
+        help='Tau base for the momentum encoder')
 
     parser.add_argument('--temperature_y', type=float,
         default=0.2,
@@ -793,18 +857,6 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint',
         default=None,
         help='Path to the checkpoint to start from')
-
-    parser.add_argument('--proj_head_eq_layers',
-        default="2048-2048-",
-        help='Size of layers of eq head')
-    
-    parser.add_argument('--proj_head_t_layers',
-        default="128",
-        help='Size of layers of param head')
-
-    parser.add_argument('--predictor_eq_layers',
-        default="one",
-        help='Size of layer of eq net')
 
     # Parse arguments
     args = parser.parse_args()

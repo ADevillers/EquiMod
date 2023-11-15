@@ -115,6 +115,32 @@ class ParamGaussianBlur(torchvision.transforms.GaussianBlur):
 
 
 
+class ParamSolarize(torchvision.transforms.RandomSolarize):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.nb_params = 1
+    
+    def get_params(self, img):
+        solarize = int(random.random() < self.p)
+
+        return [solarize]
+
+    def apply(self, img, params):
+        solarize, = params
+
+        if solarize:
+            img = F.solarize(img, self.threshold)
+
+        params = torch.FloatTensor([solarize])
+
+        return img, params
+
+    def forward(self, img):
+        params = self.get_params(img)
+        return self.apply(img, params)
+
+
+
 
 
 class ParamCompose(torch.nn.Module):

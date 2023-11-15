@@ -4,9 +4,9 @@
 #SBATCH -C v100-32g
 #SBATCH --job-name=expe
 #SBATCH --time=20:00:00
-#SBATCH --nodes=1               # TODO: Define the number of nodes
-#SBATCH --ntasks-per-node=2     # = --gres=gpu:
-#SBATCH --gres=gpu:2            # = --ntasks-per-node
+#SBATCH --nodes=8               # TODO: Define the number of nodes
+#SBATCH --ntasks-per-node=4     # = --gres=gpu:
+#SBATCH --gres=gpu:4            # = --ntasks-per-node
 #SBATCH --cpus-per-task=10
 #SBATCH --hint=nomultithread
 #SBATCH --output=./logs/expe_%j.out
@@ -32,20 +32,20 @@ srun python src/main.py \
     --hardware=multi-gpu \
     --precision=mixed \
     --nb_workers=10 \
-    --expe_name=equimod_simclr_cifar10 \
-    --dataset_name=cifar10 \
-    --resnet_type=resnet18 \
+    --expe_name=equimod_byol_imagenet \
+    --dataset_name=imagenet \
+    --resnet_type=resnet50 \
     --lmbd=1.0 \
-    --nb_epochs=800 \
+    --nb_epochs=1000 \
     --nb_epochs_warmup=10 \
-    --batch_size=512 \
-    --lr_init=4.0 \
+    --batch_size=4096 \
+    --lr_init=4.8 \
     --momentum=0.9 \
-    --weight_decay=1e-6 \
+    --weight_decay=1.5e-6 \
     --eta=1e-3 \
-    --z_dim=128 \
+    --z_dim=256 \
     --y_dim=128 \
-    --temperature_z=0.5 \
+    --tau_base=0.996 \
     --temperature_y=0.2 \
     --clsf_every=100 \
     --save_every=100 \
@@ -54,7 +54,4 @@ srun python src/main.py \
     --lr_init_clsf=0.2 \
     --momentum_clsf=0.9 \
     --weight_decay_clsf=0.0 \
-    --proj_head_eq_layers="2048-2048-" \
-    --proj_head_t_layers="128" \
-    --predictor_eq_layers="one" \
 #    --checkpoint=./checkpoints/expe_729631_even.pt \
