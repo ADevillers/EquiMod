@@ -1,4 +1,5 @@
 # EquiMod: An Equivariance Module to Improve Visual Instance Discrimination
+⚠️ **Important: This branch does not contain any code. Please switch to either the SimCLR or BYOL branch for code access.** ⚠️
 
 ## Overview
 This is the official repository of EquiMod, which introduces a generic equivariance module specifically designed to improve visual instance discrimination in self-supervised learning models. EquiMod strategically addresses the balance between invariance and sensitivity to image augmentations, a crucial aspect in representation learning. By predicting the displacement in embedding spaces caused by augmentations, EquiMod enriches the representations. This allows models like BYOL and SimCLR, when integrated with EquiMod, to not only retain essential augmentation-related information but also to enhance classification performances significantly on datasets such as CIFAR10 and ImageNet. For a deeper dive into our methodology and results, we invite you to consult our [published article](https://arxiv.org/abs/2211.01244).
